@@ -216,8 +216,6 @@
 
 
 
-
-
 // pages/Profile.jsx
 import React, { useState, useEffect } from "react";
 import { useUser, UserButton } from "@clerk/clerk-react";
@@ -269,18 +267,18 @@ function Profile() {
 
   const username = user?.username || user?.firstName || "Student";
 
-  // --- 1. INITIAL SYNC & PERSISTENCE LOGIC ---
+  // --- 1. CLERK CLOUD SYNC LOGIC (UNSAFE METADATA) ---
   useEffect(() => {
     if (isLoaded && user) {
-      // UNIQUE STORAGE KEY: Specific to this user's Clerk ID
-      const storageKey = `enrolled_courses_${user.id}`;
-      const savedEnrollments = localStorage.getItem(storageKey);
+      // Check Clerk's Cloud storage first (unsafeMetadata allows frontend writes)
+      const cloudEnrolledIds = user.unsafeMetadata?.enrolledCourseIds;
 
-      if (savedEnrollments) {
-        // If they already have data in this browser, use it
-        setEnrolled(JSON.parse(savedEnrollments));
+      if (cloudEnrolledIds && Array.isArray(cloudEnrolledIds)) {
+        // Device B: Synced from Cloud
+        const syncedCourses = initialCourses.filter(c => cloudEnrolledIds.includes(c.id));
+        setEnrolled(syncedCourses);
       } else {
-        // FIRST TIME LOGIN: Sync with the JSON dataset
+        // Device A: First time setup - check JSON fallback
         const clerkUsername = user.username || user.firstName?.toLowerCase();
         const mockUserMatch = usersData.find(u => u.username === clerkUsername);
 
@@ -289,12 +287,12 @@ function Profile() {
             mockUserMatch.enrolledCourseIds.includes(c.id)
           );
           setEnrolled(userCourses);
-          // Initialize their localStorage for future updates
-          localStorage.setItem(storageKey, JSON.stringify(userCourses));
+          // Save to Clerk Cloud immediately
+          updateClerkMetadata(mockUserMatch.enrolledCourseIds);
         }
       }
 
-      // Calculate Global Seats (Base 50 users + any local overrides)
+      // Calculate Seats based on the 50 users JSON
       const globalSeatCounts = initialCourses.map(course => {
         const count = usersData.reduce((acc, currUser) => {
           return currUser.enrolledCourseIds.includes(course.id) ? acc + 1 : acc;
@@ -305,33 +303,45 @@ function Profile() {
     }
   }, [isLoaded, user]);
 
-  // --- 2. ENROLL LOGIC (With Persistence) ---
-  const enroll = (course) => {
+  // Function to push data to Clerk (Visible in Dashboard > User > Metadata > Unsafe)
+  const updateClerkMetadata = async (courseIds) => {
+    try {
+      await user.update({
+        unsafeMetadata: {
+          enrolledCourseIds: courseIds,
+        },
+      });
+      console.log("Metadata updated in Clerk Dashboard");
+    } catch (err) {
+      console.error("Clerk Metadata Sync Error:", err);
+    }
+  };
+
+  const enroll = async (course) => {
     if (enrolled.length >= MAX_ENROLLMENTS) return alert("Limit of 3 courses reached!");
     if (enrolled.find((c) => c.id === course.id)) return alert("Already enrolled!");
     
     const target = courseList.find(c => c.id === course.id);
     if (target.enrolledCount >= COURSE_CAPACITY) return alert("Course is full!");
 
-    const updatedEnrolled = [...enrolled, course];
-    setEnrolled(updatedEnrolled);
-    
-    // PERSIST CHANGE: Save to localStorage for this user only
-    localStorage.setItem(`enrolled_courses_${user.id}`, JSON.stringify(updatedEnrolled));
+    const newEnrolled = [...enrolled, course];
+    const newIds = newEnrolled.map(c => c.id);
+
+    setEnrolled(newEnrolled);
+    await updateClerkMetadata(newIds); // Pushes to Cloud
 
     setCourseList(courseList.map(c => 
       c.id === course.id ? { ...c, enrolledCount: (c.enrolledCount || 0) + 1 } : c
     ));
   };
 
-  // --- 3. DROP LOGIC (With Persistence) ---
-  const drop = (id) => {
+  const drop = async (id) => {
     if (window.confirm("Remove this course?")) {
-      const updatedEnrolled = enrolled.filter((c) => c.id !== id);
-      setEnrolled(updatedEnrolled);
-      
-      // PERSIST CHANGE: Update storage
-      localStorage.setItem(`enrolled_courses_${user.id}`, JSON.stringify(updatedEnrolled));
+      const newEnrolled = enrolled.filter((c) => c.id !== id);
+      const newIds = newEnrolled.map(c => c.id);
+
+      setEnrolled(newEnrolled);
+      await updateClerkMetadata(newIds); // Updates Cloud
 
       setCourseList(courseList.map(c => 
         c.id === id ? { ...c, enrolledCount: Math.max(0, (c.enrolledCount || 0) - 1) } : c
@@ -339,6 +349,7 @@ function Profile() {
     }
   };
 
+  // --- UI RENDERING ---
   if (activeCourse) {
     const theme = getTheme(activeCourse.category);
     const liveCourseData = courseList.find(c => c.id === activeCourse.id);
@@ -357,11 +368,11 @@ function Profile() {
           </div>
         </div>
         
-        <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8 p-8 -mt-12">
+        <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8 p-8 -mt-12 text-left">
           <div className="lg:col-span-2">
             <div className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-slate-100">
               <h2 className={`text-2xl font-black mb-4 ${theme.text}`}>Course Overview</h2>
-              <p className="text-slate-600 text-lg leading-relaxed text-left">
+              <p className="text-slate-600 text-lg leading-relaxed">
                 Experience a deep-dive into {activeCourse.name}. This module covers foundational 
                 principles and advanced applications used in the {activeCourse.category} industry.
               </p>
@@ -409,7 +420,7 @@ function Profile() {
             <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-6 text-left">Your Path</h3>
             <div className="space-y-3">
               {enrolled.length === 0 ? (
-                <p className="text-slate-300 text-sm italic">Add a course...</p>
+                <p className="text-slate-300 text-sm italic text-left">Add a course...</p>
               ) : (
                 enrolled.map(c => {
                   const theme = getTheme(c.category);
@@ -441,7 +452,7 @@ function Profile() {
               const seatsLeft = COURSE_CAPACITY - (course.enrolledCount || 0);
 
               return (
-                <div key={course.id} className="bg-white rounded-[2.5rem] p-4 border border-slate-200 transition-all hover:shadow-2xl flex flex-col group">
+                <div key={course.id} className="bg-white rounded-[2.5rem] p-4 border border-slate-200 transition-all hover:shadow-2xl flex flex-col group text-left">
                   <div className={`h-40 rounded-[2rem] mb-6 flex items-center justify-center bg-gradient-to-br ${theme.gradient} text-white relative overflow-hidden`}>
                     <div className="text-5xl group-hover:scale-110 transition-transform">{theme.icon}</div>
                     <div className="absolute bottom-3 right-3 bg-white/20 backdrop-blur-md px-2 py-1 rounded-lg text-[9px] font-black text-white">
@@ -449,7 +460,7 @@ function Profile() {
                     </div>
                   </div>
 
-                  <div className="px-2 flex-grow flex flex-col text-left">
+                  <div className="px-2 flex-grow flex flex-col">
                     <h4 className="text-lg font-black text-slate-800 mb-4 leading-tight uppercase">{course.name}</h4>
                     <div className="grid grid-cols-2 gap-2 mt-auto">
                       <button 
